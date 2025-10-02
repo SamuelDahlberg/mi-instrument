@@ -20,6 +20,7 @@ from mi.core.log import get_logger, get_logging_metaclass
 log = get_logger()
 
 # constants
+# Some prawlers are configured without a flort. The data size without flort is 31. With flort it is variable.
 SCI_DATA_SIZE = 31
 
 # byte representations of constants
@@ -86,7 +87,7 @@ class CtdpfPWfpParser(SimpleParser):
         except:
             return -9999
 
-    def parse_record(self, data):
+    def parse_record(self, data, here):
         """
         Parse a data record from the prawler data file, storing only the ctdpf_p instrument data
         """
@@ -94,12 +95,14 @@ class CtdpfPWfpParser(SimpleParser):
         # Note: have seen science data packets terminate prematurely in files. When this
         # happens, ascii_hex_long_to_long logs an exception. Check to make sure all values are positive
 
-        epoch_time = unpack_from('>L', data)[0]
-        pressure = float(self.ascii_hex_long_to_long(5, data))
-        temperature = float(self.ascii_hex_long_to_long(10, data))
-        conductivity = float(self.ascii_hex_long_to_long(15, data))
-        # opt_temp = float(self.ascii_hex_long_to_long(20, data)) / 1000.0
-        # opt_o2 = float(self.ascii_hex_long_to_long(25, data)) / 1000.0
+        first_data = data[here:here + SCI_DATA_SIZE]
+
+        epoch_time = unpack_from('>L', data[here:here + SCI_DATA_SIZE])[0]
+        pressure = float(self.ascii_hex_long_to_long(5, first_data))
+        temperature = float(self.ascii_hex_long_to_long(10, first_data))
+        conductivity = float(self.ascii_hex_long_to_long(15, first_data))
+        # opt_temp = float(self.ascii_hex_long_to_long(20, first_data)) / 1000.0
+        # opt_o2 = float(self.ascii_hex_long_to_long(25, first_data)) / 1000.0
 
         if pressure == -9999 or temperature == -9999 or conductivity == -9999:
             return None, None
@@ -116,7 +119,15 @@ class CtdpfPWfpParser(SimpleParser):
             CtdpfPParticleKey.CONDUCTIVITY: conductivity
         }
 
-        return ctdpf_particle_data, epoch_time
+        if data[30] == ord(b','):
+            flort_len = 30
+            while (data[flort_len] != ord(b'\n')):
+                flort_len = flort_len + 1
+            science_data_size = flort_len
+        else:
+            science_data_size = 31
+
+        return ctdpf_particle_data, epoch_time, science_data_size
 
     def parse_file(self):
         """
@@ -157,9 +168,9 @@ class CtdpfPWfpParser(SimpleParser):
                 # The actual science data
                 eol = unpack_from('2s', data, here)[0]
                 while eol != b'\x0d\x0a':
-                    data_chunk = data[here:here + SCI_DATA_SIZE]
+                    # data_chunk = data[here:here + SCI_DATA_SIZE]
 
-                    ctdpf_particle_data, epoch_timestamp = self.parse_record(data_chunk)
+                    ctdpf_particle_data, epoch_timestamp, science_data_size = self.parse_record(data, here)
 
                     # If there is no data returned, there is most likely no more science data, or it is not recoverable.
                     # We will exit this section of science data if no data is returned
@@ -180,7 +191,7 @@ class CtdpfPWfpParser(SimpleParser):
                         self._record_buffer.append(particle)
                         log.trace('Parsed particle: %s' % particle.generate_dict())
 
-                    here = here + SCI_DATA_SIZE
+                    here = here + science_data_size
                     eol = unpack_from('2s', data, here)[0]
 
             # Engineering Data (unparsed)
