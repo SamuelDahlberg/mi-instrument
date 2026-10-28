@@ -61,7 +61,9 @@ class CtdpfPWfpUnitTestCase(ParserUnitTestCase):
         self.setup()  # Needed for single case testing
 
         log.debug('===== START TEST CTDPF_P_WFP Parser =====')
-        with open(self.file_path('prkt_20250507_DEPLOYMENT2.DAT')) as in_file:
+        # prkt_20240502_130021.DAT
+        # prkt_20250507_DEPLOYMENT2.DAT
+        with open(self.file_path('prkt_20240502_130021.DAT')) as in_file:
             parser = self.create_ctdpf_p_parser(in_file)
 
             # In a single read, get all particles in this file.

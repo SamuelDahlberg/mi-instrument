@@ -6,38 +6,62 @@
 @author Samuel Dahlberg
 @brief Parser for the dofst_p_wfp dataset driver.
 
-This file contains code for the dofst_p_wfp parser and code to produce data particles
-for the instrument  data from the Prawler WFP instrument. Files are mixed binary and ascii.
+This file contains code for the dofst_p_wfp parser and code to produce data
+particles for the DOFST instrument data from the Prawler WFP instrument
+(CTD + DOFST, with an optional FLORT). Files are mixed binary/ASCII.
+
+Science section layout (record type 'E'):
+
+    '@@@' <u16 len> <u16 len> 'E'           len (stored twice) and data type.
+                                            Len being number of characters after this header
+    '@@@' <u16 crc> <u16 len> 'E'           inner header; CRC-16/XMODEM and len
+                                            This len being number of characters after this inner header
+    column list (e.g. 'EP,CD,CT,CC,OT,O2,CH,TB[,C3]') \r\n
+    Science records
+    \r\n                                   section terminator
+
+Science record:
+
+    bytes 0-3   uint32 big-endian unix epoch  -- RAW BINARY
+    byte  4     ','
+    After that, comma-separated ASCII-hex fields, one per column-list entry after EP (epoch time)
+    CD,CT,CC (CTD), OT,O2 (DOFST), CH,TB,C3 (FLORT, when applicable).
+    Science Fields are printed '%04x' style: Fields are 4 char minimum but will increase up to 8.
+    terminated by LF CR (\n\r), different order than the section terminator
+
+Other fields 'G' (engineering) and 'S' (station-list) are skipped
 """
+
+import binascii
 import re
 from struct import unpack_from
+
 from mi.core.common import BaseEnum
 from mi.core.exceptions import SampleException
-from mi.dataset.dataset_parser import SimpleParser
 from mi.core.instrument.dataset_data_particle import DataParticle, DataParticleKey
-from mi.core.log import get_logger, get_logging_metaclass
+from mi.core.log import get_logger
+from mi.dataset.dataset_parser import SimpleParser
 
 log = get_logger()
 
-# constants
-SCI_DATA_SIZE = 31
+# seconds between the NTP epoch (1900-01-01) and the unix epoch (1970-01-01)
+NTP_EPOCH_OFFSET = 2208988800
 
-# byte representations of constants
-STRING = b'(.+)'
-INTEGER = b'([+-]?[0-9]+)'
-NEWLINE = b'(?:\r\n|\n)?'
-FLOAT = b'([+-]?\d+.\d+[Ee]?[+-]?\d*)'  # includes scientific notation
+EPOCH_LEN = 4                    # leading binary timestamp
+HEX_FIELD_LEN = 4                # width of a settled ASCII-hex field
+MIN_CTD_FIELDS = 3               # CD, CT, CC
+SCIENCE_TYPE = b'E'
+SECTION_TERMINATOR = b'\r\n'
 
-# Regex pattern for the start of a binary prawler data packet
-REC_PATTERN = (
-    b'Record\[(\d+)\]:@@@'
-)
-REC_REGEX = re.compile(REC_PATTERN, re.DOTALL)
+# Regex for the start of a prawler data packet, and for a record terminator
+# byte. Records end LF CR, but a lone LF or CR is tolerated; the terminator
+# search must start after the binary epoch, which can contain either byte.
+REC_REGEX = re.compile(br'Record\[(\d+)\]:@@@')
+RECORD_END = re.compile(br'[\r\n]')
 
 
 class DataParticleType(BaseEnum):
     DOFST_P = 'dofst_p_wfp_instrument'
-    __metaclass__ = get_logging_metaclass(log_level='trace')
 
 
 class DofstPDataParticle(DataParticle):
@@ -53,10 +77,8 @@ class DofstPDataParticle(DataParticle):
         @return: list containing type encoded "particle value id:value" dictionary pairs
         """
 
-        return [{DataParticleKey.VALUE_ID: name, DataParticleKey.VALUE: None}
-                if self.raw_data[name] is None else
-                {DataParticleKey.VALUE_ID: name, DataParticleKey.VALUE: value}
-                for name, value in self.raw_data.iteritems()]
+        return [{DataParticleKey.VALUE_ID: name, DataParticleKey.VALUE: value}
+                for name, value in self.raw_data.items()]
 
 
 class DofstPParticleKey(BaseEnum):
@@ -74,116 +96,137 @@ class DofstPWfpParser(SimpleParser):
     Will parse the dofst specific data from the generic prawler file.
     """
 
-    def ascii_hex_long_to_long(self, start, data):
+    @staticmethod
+    def parse_hex_field(field):
         """
-        Converts a 4 char sequence of ascii hex characters into a long value in big endian order
+        Convert one ASCII-hex science field to an int.
+        @return: the value, or None if the field is malformed or not the
+        settled 4-char width (an oversized field is a stale buffer value,
+        seen at the start of bursts; it is not a usable reading).
         """
-        # int conversion requires no comma trailing hex long
-        long_str = unpack_from('4s', data, start)[0]
-
+        if len(field) != HEX_FIELD_LEN:
+            return None
         try:
-            return int(long_str, 16)
-        except:
-            return -9999
+            return int(field, 16)
+        except ValueError:
+            return None
 
-    def parse_record(self, data):
+    def parse_record(self, data, here, section_end):
+        """
+        Parse one science record beginning at offset `here`. Store only the dofst_p instrument data
+        @return: (particle_data, epoch_time, record_size).
+        particle_data is None with a valid size when the record's values are
+        unusable but its boundary was found (caller may skip just this
+        record); all three are None when the record structure is
+        unrecoverable (caller should abandon the section).
+        """
+
+        if here + EPOCH_LEN + 1 > section_end:
+            return None, None, None
+
+        epoch_time = unpack_from('>L', data, here)[0]
+
+        if data[here + EPOCH_LEN:here + EPOCH_LEN + 1] != b',':
+            return None, None, None
+
+        # Find the record terminator, then size the record. Fields are
+        # variable width, so scanning is the only reliable way to do this.
+        match = RECORD_END.search(data, here + EPOCH_LEN + 1, section_end)
+        if match is None:
+            return None, None, None
+        end = match.start()
+
+        record_size = end - here + 1
+        second = data[end + 1:end + 2]
+        if second in (b'\r', b'\n') and second != data[end:end + 1]:
+            record_size += 1                    # LF CR (or CR LF) pair
+
+        fields = data[here + EPOCH_LEN + 1:end].split(b',')
+        if len(fields) < MIN_CTD_FIELDS:
+            return None, epoch_time, record_size
+
+        opt_temp = self.parse_hex_field(fields[3])       # OT
+        opt_o2 = self.parse_hex_field(fields[4])         # O2
+        # fields[0:4] are CTDPF (CD, CT, CC); fields[5:8] are FLORT counts when
+        # a FLORT is fitted. They are parsed by their own drivers.
+
+        if opt_temp is None or opt_o2 is None:
+            return None, epoch_time, record_size
+
+        # Decimal precision provided by McLane
+        particle_data = {
+            DofstPParticleKey.TEMPERATURE: opt_temp / 1000.0,
+            DofstPParticleKey.DIS_OXG: opt_o2 / 1000.0,
+        }
+
+        return particle_data, epoch_time, record_size
+
+    def parse_file(self):
         """
         Parse a data record from the prawler data file, storing only the dofst_p instrument data
         """
 
-        # Note: have seen science data packets terminate prematurely in files. When this
-        # happens, ascii_hex_long_to_long logs an exception. Check to make sure all values are positive
-
-        epoch_time = unpack_from('>L', data)[0]
-        # pressure = float(self.ascii_hex_long_to_long(5, data))
-        # temperature = float(self.ascii_hex_long_to_long(10, data))
-        # conductivity = float(self.ascii_hex_long_to_long(15, data))
-        opt_temp = float(self.ascii_hex_long_to_long(20, data))
-        opt_o2 = float(self.ascii_hex_long_to_long(25, data))
-
-        if opt_temp == -9999 or opt_o2 == -9999:
-            return None, None
-
-        # Decimal precision provided by McClane
-
-        opt_temp = opt_temp / 1000.0
-        opt_o2 = opt_o2 / 1000.0
-
-        dofst_particle_data = {
-            DofstPParticleKey.TEMPERATURE: opt_temp,
-            DofstPParticleKey.DIS_OXG: opt_o2,
-        }
-
-        return dofst_particle_data, epoch_time
-
-    def parse_file(self):
-        """
-        Parse the prawler file.
-        Read file line by line.
-        @return: dictionary of data values with the particle names as keys
-        """
-
         data = self._stream_handle.read()
 
-        matches = REC_REGEX.finditer(data)
+        for record_match in REC_REGEX.finditer(data):
+            start = record_match.end() - 3  # offset of '@@@'
 
-        for record_match in matches:
-            start = record_match.start()
+            if len(data) < start + 8:
+                break  # header cut off at EOF
+            if data[start + 7:start + 8] != SCIENCE_TYPE:
+                continue  # 'G', 'S'
 
-            # Scan past "Record[nnn]:" to type of records
-            rec_type_start = data.find(b':', start)
-            if rec_type_start >= 0:
-                start = rec_type_start + 1
+            # Grabs the science data length, a value stored in the header.
+            section_start = start + 8
+            payload_len = unpack_from('>H', data, start + 3)[0]
+            section_end = section_start + payload_len
 
-            rectype = data[start + 7]
+            # Broken science data exception
+            if section_end > len(data):
+                self._exception_callback(SampleException(
+                    'Science section at offset %d extends past end of file' % start))
+                # We could parse what is there, but I think we want to avoid in case bad data
+                # section_end = len(data)                  # parse what is there
+                continue
+            # If science header length does not end on an expected line break character...
+            elif data[section_end:section_end + 2] != SECTION_TERMINATOR:
+                self._exception_callback(SampleException(
+                    'Science section at offset %d has an inconsistent length header' % start))
+                continue
+            # Check the crc cert to make sure the data natches what the instrument expects
+            elif data[section_start:section_start + 3] == b'@@@':
+                stored_crc, crc_len = unpack_from('>2H', data, section_start + 3)
+                if binascii.crc_hqx(data[section_start + 8:section_end], 0) != stored_crc:
+                    self._exception_callback(SampleException(
+                        'Science section at offset %d failed its CRC check' % start))
 
-            # Science profile data
-            if rectype == 'E':
-                rec_start = unpack_from('<3s', data, start)[0]
+            # skip the column list line
+            columns_end = data.find(b'\r\n', section_start, section_end)
+            if columns_end < 0:
+                continue
+            here = columns_end + 2
 
-                if rec_start != b'@@@':
-                    continue
+            # Parse and save each data record
+            while here < section_end:
+                particle_data, epoch_time, record_size = \
+                    self.parse_record(data, here, section_end)
 
-                # skip column list (ends in \r\n)
-                here = start + 8
-                eol = unpack_from('2s', data, here)[0]
-                while eol != b'\x0d\x0a':
-                    here = here + 1
-                    eol = unpack_from('2s', data, here)[0]
-                here = here + 2
+                if record_size is None:
+                    log.error('Unrecoverable science record at offset %d', here)
+                    self._exception_callback(SampleException(
+                        'Unrecoverable science record at offset %d' % here))
+                    break
 
-                # The actual science data
-                eol = unpack_from('2s', data, here)[0]
-                while eol != b'\x0d\x0a':
-                    data_chunk = data[here:here + SCI_DATA_SIZE]
-
-                    dofst_particle_data, epoch_timestamp = self.parse_record(data_chunk)
-
-                    # If there is no data returned, there is most likely no more science data, or it is not recoverable.
-                    # We will exit this section of science data if no data is returned
-                    if dofst_particle_data is None:
-                        log.error('Erroneous data found')
-                        self._exception_callback(
-                            SampleException('Erroneous data found')
-                        )
-                        break
-
-                    # Convert timestamp to ntp timestamp
-                    timestamp = epoch_timestamp + 2208988800
-
-                    particle = self._extract_sample(self._particle_class, None, dofst_particle_data,
-                                                    internal_timestamp=timestamp)
-
+                if particle_data is None:
+                    log.error('Erroneous science record at offset %d', here)
+                    self._exception_callback(SampleException(
+                        'Erroneous science record at offset %d' % here))
+                else:
+                    particle = self._extract_sample(
+                        self._particle_class, None, particle_data,
+                        internal_timestamp=epoch_time + NTP_EPOCH_OFFSET)
                     if particle is not None:
                         self._record_buffer.append(particle)
-                        log.trace('Parsed particle: %s' % particle.generate_dict())
+                        log.trace('Parsed particle: %r', particle_data)
 
-                    here = here + SCI_DATA_SIZE
-                    eol = unpack_from('2s', data, here)[0]
-
-            # Engineering Data (unparsed)
-            elif rectype == 'G':
-                continue
-            # Station list data (unparsed)
-            elif rectype == 'S':
-                continue
+                here += record_size
